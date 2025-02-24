@@ -1,5 +1,16 @@
 # %% [markdown]
-# ### **Imports**
+# # Sleep Estimation Function
+# 
+# This notebook analyzes YouTube history data to estimate sleep patterns based on activity gaps.
+# It converts timestamps to Eastern Standard Time (EST) and applies constraints to detect likely sleep periods.
+# 
+# The script then aggregates daily and weekly metrics (e.g., total videos, watch time via capped gaps, and inter-event durations)
+# and generates several graphs which are stored in a subdirectory called "graphs".
+# 
+# Use the detailed README to process your own data.
+
+# %% [markdown]
+# ### Imports
 
 # %%
 import os
@@ -9,7 +20,7 @@ import numpy as np
 import matplotlib.pyplot as plt
 
 # %% [markdown]
-# ### **Data Loading and Parsing Functions**
+# ### Data Loading and Parsing Functions
 
 # %%
 def load_history(file_path):
@@ -21,7 +32,7 @@ def load_history(file_path):
 def parse_record(record):
     """
     Parse an individual record.
-    Accept only entries whose "title" starts with "Watched" and which do not contain the detail "From Google Ads".
+    Accept only entries whose "title" starts with "Watched" and that do not contain "From Google Ads".
     """
     if "details" in record:
         for detail in record["details"]:
@@ -32,14 +43,13 @@ def parse_record(record):
         return None
     time_str = record.get("time")
     try:
-        # Convert timestamp string to a timezone-aware datetime (UTC)
-        dt = pd.to_datetime(time_str)
+        dt = pd.to_datetime(time_str)  # parsed in UTC by default
     except Exception:
         return None
     return {"datetime": dt, "title": title}
 
 def load_and_parse_histories(watch_file, search_file):
-    """Load records from watch and search history files and combine valid watch events."""
+    """Load and combine valid records from the two JSON files."""
     watch_data = load_history(watch_file)
     search_data = load_history(search_file)
     records = []
@@ -54,14 +64,17 @@ def load_and_parse_histories(watch_file, search_file):
     return records
 
 # %% [markdown]
-# ### **Sleep Estimation Function**
+# ### Sleep Estimation Function
 
 # %%
 def estimate_sleep_periods(df, threshold_hours=5):
     """
-    Estimate sleep periods by detecting gaps between successive events longer than threshold_hours.
-    For each gap, record the final event before the gap and the first event after the gap.
-    The sleep_start and sleep_end times are converted to Eastern Time (EST).
+    Estimate sleep periods based on gaps longer than threshold_hours.
+    For each gap, convert the final event before the gap ("sleep_start") and the first event after ("sleep_end")
+    from UTC to Eastern Standard Time (EST), then only accept the candidate if:
+      - The gap duration is between 3 and 12 hours.
+      - The sleep_start (final video before sleep) is roughly between 2 AM and 7 AM.
+      - The sleep_end (first video after sleep) is roughly between 10 AM and 2 PM.
     """
     df_sorted = df.sort_values("datetime").reset_index(drop=True)
     df_sorted["time_diff"] = df_sorted["datetime"].diff()
@@ -69,50 +82,63 @@ def estimate_sleep_periods(df, threshold_hours=5):
     sleep_periods = []
     for i in range(1, len(df_sorted)):
         if df_sorted.loc[i, "time_diff"] > threshold:
-            # Convert times from UTC to Eastern Standard Time (EST)
-            sleep_start_est = df_sorted.loc[i - 1, "datetime"].tz_convert("America/New_York")
-            sleep_end_est   = df_sorted.loc[i, "datetime"].tz_convert("America/New_York")
+            # Convert times to EST
+            sleep_start_est = df_sorted.loc[i-1, "datetime"].tz_convert("America/New_York")
+            sleep_end_est = df_sorted.loc[i, "datetime"].tz_convert("America/New_York")
             duration = sleep_end_est - sleep_start_est
+            if duration < pd.Timedelta(hours=3) or duration > pd.Timedelta(hours=12):
+                continue
+            final_video_hour = sleep_start_est.hour + sleep_start_est.minute / 60 + sleep_start_est.second / 3600
+            first_video_hour = sleep_end_est.hour + sleep_end_est.minute / 60 + sleep_end_est.second / 3600
+            if not (2 <= final_video_hour <= 7):
+                continue
+            if not (10 <= first_video_hour <= 14):
+                continue
             sleep_periods.append({
-                "sleep_start": sleep_start_est,   # in EST
-                "sleep_end": sleep_end_est,         # in EST
+                "sleep_start": sleep_start_est,
+                "sleep_end": sleep_end_est,
                 "duration": duration,
-                "final_video_hour": sleep_start_est.hour + sleep_start_est.minute/60 + sleep_start_est.second/3600,
-                "first_video_hour": sleep_end_est.hour + sleep_end_est.minute/60 + sleep_end_est.second/3600
+                "final_video_hour": final_video_hour,
+                "first_video_hour": first_video_hour
             })
     return pd.DataFrame(sleep_periods)
 
 # %% [markdown]
-# ### **Day-Level Aggregation Functions**
+# ### Day-Level Aggregation Functions
 
 # %%
 def compute_estimated_durations(events):
     """
-    Given a DataFrame of events for one day interval (sorted by datetime),
-    estimate the inter-event duration (in seconds) as the gap to the next event,
-    capped at 15 minutes (900 sec) to avoid inflating watch time.
+    Compute the gap between consecutive events (capped at 15 minutes or 900 sec)
+    for events in one day. Returns a list of durations in seconds.
     """
-    cap_seconds = 900  # 15 minutes in seconds
+    cap_seconds = 900  # 15 minutes
     durations = []
     times = events["datetime"].tolist()
     for i in range(len(times) - 1):
-        gap_sec = (times[i + 1] - times[i]).total_seconds()
+        gap_sec = (times[i+1] - times[i]).total_seconds()
         durations.append(min(gap_sec, cap_seconds))
     return durations
 
 def aggregate_day_metrics(df, sleep_df):
     """
-    Define day intervals using consecutive sleep_end times (which indicate the start of a day).
-    For each day, compute:
-      - Total videos watched.
-      - Estimated total watch time (sum of capped inter-event gaps in seconds).
-      - Average inter-event duration (in seconds).
-      - Video length differential between first and last inter-event duration.
+    Define "days" using consecutive sleep_end times (which denote day-start boundaries).
+    For each day interval, compute:
+      - The total number of videos watched.
+      - The estimated total watch time (sum of capped gaps in seconds).
+      - The average inter-event duration.
+      - The video length differential (difference between first and last gap).
+      
+    Updated: If there is activity after the last sleep boundary, we add an extra boundary using the time of the last event.
     """
-    sleep_end_times = sorted(sleep_df["sleep_end"])
+    sleep_end_times = sorted(sleep_df["sleep_end"].tolist())
+    last_event_time = df["datetime"].max()
+    if last_event_time > sleep_end_times[-1]:
+        sleep_end_times.append(last_event_time)
+    
     day_records = []
     for i in range(1, len(sleep_end_times)):
-        day_start = sleep_end_times[i - 1]
+        day_start = sleep_end_times[i-1]
         day_end = sleep_end_times[i]
         subset = df[(df["datetime"] >= day_start) & (df["datetime"] < day_end)].sort_values("datetime")
         if subset.empty:
@@ -121,26 +147,20 @@ def aggregate_day_metrics(df, sleep_df):
         durations = compute_estimated_durations(subset)
         total_time = sum(durations) if durations else 0
         avg_duration = total_time / len(durations) if durations else 0
-        if durations:
-            first_duration = durations[0]
-            last_duration = durations[-1]
-            length_diff = first_duration - last_duration
-        else:
-            length_diff = 0
+        length_diff = durations[0] - durations[-1] if durations else 0
         day_records.append({
-            "day_start": day_start,      # already in EST (from sleep_end)
+            "day_start": day_start,
             "day_end": day_end,
             "total_videos": total_videos,
-            "total_time": total_time,    # seconds
-            "avg_duration": avg_duration,  # seconds
+            "total_time": total_time,       # in seconds
+            "avg_duration": avg_duration,   # in seconds
             "length_diff": length_diff
         })
     return pd.DataFrame(day_records)
 
 def aggregate_weekly(day_df, overall_start):
     """
-    Aggregate day-level metrics into weeks.
-    'week_index' is calculated using the day_start relative to an overall start date.
+    Aggregate the day-level metrics into weeks based on the day_start relative to an overall start date.
     """
     day_df = day_df.copy()
     day_df["week_index"] = day_df["day_start"].apply(lambda x: (x - overall_start).days // 7)
@@ -166,7 +186,7 @@ def aggregate_sleep_by_week(sleep_df, overall_start):
 
 def aggregate_sleep_by_day(sleep_df, start_date, end_date):
     """
-    Group sleep boundary records by day for a given period (e.g., the last month).
+    Group sleep boundary records by day for a specified date range.
     """
     sleep_day = sleep_df[(sleep_df["sleep_start"] >= start_date) & (sleep_df["sleep_start"] <= end_date)].copy()
     sleep_day["day"] = sleep_day["sleep_start"].dt.date
@@ -177,53 +197,55 @@ def aggregate_sleep_by_day(sleep_df, start_date, end_date):
     return daily
 
 # %% [markdown]
-# ### **Main Analysis and Plotting**
+# ### Main Analysis and Plotting
 
 # %%
 def main():
-    # Define file paths (ensure JSON files are in the "history" folder)
+    # Create a subdirectory for graphs if it doesn't exist.
+    graphs_dir = "graphs"
+    os.makedirs(graphs_dir, exist_ok=True)
+    
+    # Define file paths (ensure the "history" directory is in the same directory as this script/notebook)
     watch_file = os.path.join("history", "watch-history.json")
     search_file = os.path.join("history", "search-history.json")
     
-    # Load and parse records
     records = load_and_parse_histories(watch_file, search_file)
     if not records:
         print("No valid records found.")
         return
     df = pd.DataFrame(records)
     
-    # Filter to target 6-month period: Aug 22, 2024 to Feb 22, 2025.
+    # Filter to the target 6-month period: Aug 22, 2024 to Feb 22, 2025.
     start_range = pd.to_datetime("2024-08-22").tz_localize("UTC")
     end_range = pd.to_datetime("2025-02-22").tz_localize("UTC")
     df = df[(df["datetime"] >= start_range) & (df["datetime"] <= end_range)].reset_index(drop=True)
     df.sort_values("datetime", inplace=True)
     
-    # Estimate sleep periods (the returned times are converted to EST)
     sleep_df = estimate_sleep_periods(df, threshold_hours=5)
     if sleep_df.empty:
-        print("No sleep periods detected.")
+        print("No sleep periods detected based on the current filters.")
         return
 
-    # Aggregate day-level metrics using sleep_end (day starts, in EST)
     day_df = aggregate_day_metrics(df, sleep_df)
     if day_df.empty:
         print("No day metrics computed.")
         return
     
-    # Define overall start (also convert to EST for consistency)
     overall_start = start_range.tz_convert("America/New_York")
     weekly_day = aggregate_weekly(day_df, overall_start)
     weekly_sleep = aggregate_sleep_by_week(sleep_df, overall_start)
     
-    # Define "last month" as the final 30 days of the period; convert boundaries to EST.
-    last_month_start = end_range - pd.Timedelta(days=30)
+    # Update the last month range to be prior to 2025-02-09 (for example, 2025-01-09 to 2025-02-09)
+    last_month_end = pd.to_datetime("2025-02-09").tz_localize("UTC")
+    last_month_start = last_month_end - pd.Timedelta(days=30)
+    last_month_end_est = last_month_end.tz_convert("America/New_York")
     last_month_start_est = last_month_start.tz_convert("America/New_York")
-    end_range_est = end_range.tz_convert("America/New_York")
-    daily_sleep_last_month = aggregate_sleep_by_day(sleep_df, last_month_start_est, end_range_est)
-    last_month_day_df = day_df[(day_df["day_start"] >= last_month_start_est) & (day_df["day_start"] <= end_range_est)]
+    
+    daily_sleep_last_month = aggregate_sleep_by_day(sleep_df, last_month_start_est, last_month_end_est)
+    last_month_day_df = day_df[(day_df["day_start"] >= last_month_start_est) & (day_df["day_start"] <= last_month_end_est)]
     
     ###############################
-    # Generate Graphs with Updated Legends and Axes Labels
+    # Generate Graphs with Improved Legends and Save to 'graphs' Subdirectory
     ###############################
     
     ## Graph 1: Weekly Average Sleep Boundary Times (6 Months)
@@ -237,7 +259,7 @@ def main():
     ax1.set_title("Weekly Average Sleep Boundary Times (6 Months)")
     ax1.legend()
     plt.tight_layout()
-    fig1.savefig("weekly_sleep_times_6m.png")
+    fig1.savefig(os.path.join(graphs_dir, "weekly_sleep_times_6m.png"))
     plt.show()
     
     ## Graph 2: Daily Sleep Boundary Times (Last Month)
@@ -251,7 +273,7 @@ def main():
     ax2.set_title("Daily Sleep Boundary Times (Last Month)")
     ax2.legend()
     plt.tight_layout()
-    fig2.savefig("daily_sleep_times_last_month.png")
+    fig2.savefig(os.path.join(graphs_dir, "daily_sleep_times_last_month.png"))
     plt.show()
     
     ## Graph 3: Daily Aggregated Metrics (6 Months)
@@ -264,14 +286,14 @@ def main():
     axs3[1].set_ylabel("Total Watch Time (min)")
     
     axs3[2].plot(day_df["day_start"], day_df["avg_duration"], marker="o", color="orange")
-    axs3[2].set_ylabel("Average Inter-Event Duration (sec)")
+    axs3[2].set_ylabel("Avg Inter-Event Duration (sec)")
     
     axs3[3].plot(day_df["day_start"], day_df["length_diff"], marker="o", color="purple")
     axs3[3].set_ylabel("Video Length Differential (sec)")
     axs3[3].set_xlabel("Day Start (EST)")
     
     plt.tight_layout()
-    fig3.savefig("daily_metrics_6m.png")
+    fig3.savefig(os.path.join(graphs_dir, "daily_metrics_6m.png"))
     plt.show()
     
     ## Graph 4: Daily Metrics (Last Month)
@@ -287,7 +309,7 @@ def main():
     axs4[1].set_xlabel("Day Start (EST)")
     
     plt.tight_layout()
-    fig4.savefig("daily_metrics_last_month.png")
+    fig4.savefig(os.path.join(graphs_dir, "daily_metrics_last_month.png"))
     plt.show()
     
     ## Graph 5: Histogram of Video Length Differential (6 Months)
@@ -297,7 +319,7 @@ def main():
     ax5.set_ylabel("Frequency")
     ax5.set_title("Histogram of Video Length Differential (6 Months)")
     plt.tight_layout()
-    fig5.savefig("video_length_diff_hist_6m.png")
+    fig5.savefig(os.path.join(graphs_dir, "video_length_diff_hist_6m.png"))
     plt.show()
     
     ## Graph 6: Histogram of Inferred Sleep Durations (6 Months)
@@ -308,20 +330,17 @@ def main():
     ax6.set_ylabel("Frequency")
     ax6.set_title("Histogram of Inferred Sleep Durations (6 Months)")
     plt.tight_layout()
-    fig6.savefig("sleep_duration_hist_6m.png")
+    fig6.savefig(os.path.join(graphs_dir, "sleep_duration_hist_6m.png"))
     plt.show()
     
     ## Graph 7: Scatter Plot of Final Video Time vs. Sleep Duration (EST) with Trend Line
     fig7, ax7 = plt.subplots(figsize=(10, 5))
-    # Plot all data points (in EST)
     sleep_durations = sleep_df["duration"].dt.total_seconds() / 3600
     ax7.scatter(sleep_df["final_video_hour"], sleep_durations, color="red", alpha=0.7, label="Data Points")
-    # For the trend line, filter out sleep durations longer than 12 hours (likely bad data)
     filtered = sleep_df[sleep_df["duration"].dt.total_seconds() / 3600 <= 12]
     if not filtered.empty:
         x_filtered = filtered["final_video_hour"]
         y_filtered = filtered["duration"].dt.total_seconds() / 3600
-        # Compute linear regression – trend line on filtered data
         coef = np.polyfit(x_filtered, y_filtered, deg=1)
         poly1d_fn = np.poly1d(coef)
         x_range = np.linspace(x_filtered.min(), x_filtered.max(), 100)
@@ -329,13 +348,11 @@ def main():
                  label="Trend Line (Sleep ≤ 12 hrs)")
     ax7.set_xlabel("Final Video Time Before Sleep (EST, 24-Hour)")
     ax7.set_ylabel("Sleep Duration (hours)")
-    ax7.set_title("Scatter Plot: Final Video Time vs. Sleep Duration (EST)")
+    ax7.set_title("Scatter: Final Video Time vs. Sleep Duration (EST)")
     ax7.legend()
     plt.tight_layout()
-    fig7.savefig("final_time_vs_sleep_duration.png")
+    fig7.savefig(os.path.join(graphs_dir, "final_time_vs_sleep_duration.png"))
     plt.show()
 
 if __name__ == "__main__":
     main()
-
-
