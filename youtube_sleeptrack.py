@@ -1,5 +1,5 @@
 # %% [markdown]
-# # Sleep Estimation Function
+# # YouTube History Sleep Estimator
 # 
 # This notebook analyzes YouTube history data to estimate sleep patterns based on activity gaps.
 # It converts timestamps to Eastern Standard Time (EST) and applies constraints to detect likely sleep periods.
