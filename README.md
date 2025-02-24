@@ -118,6 +118,11 @@ The code generates several plots that provide insight into your YouTube viewing 
 - `graphs/`  
   **(Automatically created)**  
   Directory where all generated graphs are saved.
+  
+## Example Graphs
+
+Below are some example graphs, which are also provided in the `graphs/` directory.
+<img width="614" alt="example_graphs" src="https://github.com/user-attachments/assets/e782c989-06d4-488d-a7a6-c166e817816f" />
 
 ## License
 
